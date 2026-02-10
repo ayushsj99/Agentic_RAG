@@ -1,7 +1,7 @@
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain.tools import tool
-from database.chroma_db_setup import vector_store_chroma
+from database.database_config import vector_store, DATABASE_BACKEND
 from models.ollama_emb import ollama_embeddings
 from models.ollama_LLM import ollama_model
 from backend.agent_logger import log
@@ -18,8 +18,10 @@ USE_MMR = True
 USE_MULTI_QUERY = True
 USE_HYDE = True
 USE_RERANK = True
+USE_HYBRID = True  # Use Milvus native hybrid search (dense + BM25)
 
 _reranker = None
+_milvus_ranker = None
 
 
 def _get_reranker():
@@ -35,21 +37,42 @@ def _get_reranker():
     return _reranker if _reranker else None
 
 
+def _get_milvus_ranker():
+    global _milvus_ranker
+    if _milvus_ranker is None:
+        try:
+            from langchain_milvus import WeightedRanker
+            _milvus_ranker = WeightedRanker(0.6, 0.4)  # 60% dense, 40% sparse (BM25)
+            log("retriever", "Loaded Milvus WeightedRanker for hybrid search")
+        except ImportError:
+            log("retriever", "WeightedRanker not available, using default")
+            _milvus_ranker = False
+    return _milvus_ranker if _milvus_ranker else None
+
+
+@retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
+def _hybrid_search(query: str, k: int = FINAL_K):
+    ranker = _get_milvus_ranker()
+    if ranker:
+        return vector_store.similarity_search(query, k=k, ranker=ranker)
+    return vector_store.similarity_search(query, k=k)
+
+
 @retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
 def _mmr_search(query: str, k: int = FINAL_K, fetch_k: int = FETCH_K):
-    return vector_store_chroma.max_marginal_relevance_search(
+    return vector_store.max_marginal_relevance_search(
         query, k=k, fetch_k=fetch_k, lambda_mult=LAMBDA_MULT
     )
 
 
 @retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
 def _similarity_search_with_scores(query: str, k: int = 10):
-    return vector_store_chroma.similarity_search_with_relevance_scores(query, k=k)
+    return vector_store.similarity_search_with_relevance_scores(query, k=k)
 
 
 @retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
 def _similarity_search(query: str, k: int = 10):
-    return vector_store_chroma.similarity_search(query, k=k)
+    return vector_store.similarity_search(query, k=k)
 
 
 def _generate_query_variants(query: str, n: int = 3) -> list[str]:
@@ -153,7 +176,16 @@ def _parallel_search(queries: list[str], search_fn, k: int = 5) -> list[list]:
 
 def _advanced_retrieve(query: str) -> list:
     ranked_lists = []
-    search_fn = _mmr_search if USE_MMR else _similarity_search
+    
+    # Select search function based on backend and settings
+    if DATABASE_BACKEND == "milvus" and USE_HYBRID:
+        search_fn = _hybrid_search
+        log("retriever", "Using Milvus hybrid search (dense + BM25)")
+    elif USE_MMR:
+        search_fn = _mmr_search
+    else:
+        search_fn = _similarity_search
+    
     original_docs = search_fn(query, k=FETCH_K if not USE_MMR else FINAL_K * 2)
     ranked_lists.append(original_docs)
     log("retriever", f"Original query retrieved {len(original_docs)} docs")

@@ -54,8 +54,7 @@ def grade_documents(
             "Could not find relevant documents -> cannot answer.")
         return "cannot_answer"
 
-    # Take a sample of the context (first 1500 chars) so the LLM
-    # doesn't get overwhelmed and actually reads the content
+
     context_sample = context[:1500]
     log("doc_grader", "Grading retrieved documents for relevance...")
     log("doc_grader", f"  Question: {question[:150]}")

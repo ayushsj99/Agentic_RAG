@@ -6,8 +6,9 @@ from Agent.agent import graph, GRAPH_RECURSION_LIMIT
 from langgraph.errors import GraphRecursionError
 from backend.ingestion_pipeline import ingest_document
 from backend.agent_logger import log, get_logs, clear as clear_logs
-from database.reset_chroma import reset_chroma_db
-from backend.exceptions import check_ollama_health, check_chroma_health
+from database.reset_db import reset_database
+from database.database_config import DATABASE_BACKEND
+from backend.exceptions import check_ollama_health, check_database_health
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "backend", "data")
 DATA_DIR = os.path.abspath(DATA_DIR)
@@ -26,7 +27,7 @@ with st.sidebar:
     
     with st.expander("🔧 Service Status", expanded=not st.session_state.services_checked):
         ollama_ok = check_ollama_health()
-        chroma_ok = check_chroma_health()
+        db_ok = check_database_health()
         st.session_state.services_checked = True
         
         if ollama_ok:
@@ -34,10 +35,11 @@ with st.sidebar:
         else:
             st.error("Ollama: Not available")
         
-        if chroma_ok:
-            st.success("ChromaDB: Connected")
+        db_name = "ChromaDB" if DATABASE_BACKEND == "chroma" else "Milvus"
+        if db_ok:
+            st.success(f"{db_name}: Connected")
         else:
-            st.warning("ChromaDB: Not initialized")
+            st.warning(f"{db_name}: Not initialized")
 
     uploaded_file = st.file_uploader(
         "Upload a document",
@@ -62,7 +64,7 @@ with st.sidebar:
 
     if st.button("🗑️ Reset Chat & Database", use_container_width=True):
         try:
-            removed = reset_chroma_db()
+            removed = reset_database()
             for f in os.listdir(DATA_DIR):
                 path = os.path.join(DATA_DIR, f)
                 if os.path.isfile(path):

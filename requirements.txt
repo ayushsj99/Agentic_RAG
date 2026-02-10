@@ -6,6 +6,7 @@ bs4
 langchain[google-genai]
 langchain-google-genai
 langchain-milvus
+pymilvus
 langchain-docling
 unstructured[all-docs]
 langchain-ollama

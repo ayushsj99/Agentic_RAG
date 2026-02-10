@@ -71,6 +71,27 @@ def check_chroma_health() -> bool:
         return False
 
 
+def check_milvus_health(uri: str = "http://localhost:19530") -> bool:
+    try:
+        from pymilvus import connections
+        host = uri.replace("http://", "").split(":")[0]
+        port = uri.replace("http://", "").split(":")[1]
+        connections.connect(alias="health_check", host=host, port=port)
+        connections.disconnect("health_check")
+        return True
+    except:
+        return False
+
+
+def check_database_health() -> bool:
+    from database.database_config import DATABASE_BACKEND
+    if DATABASE_BACKEND == "chroma":
+        return check_chroma_health()
+    elif DATABASE_BACKEND == "milvus":
+        return check_milvus_health()
+    return False
+
+
 def validate_query(query: str, max_length: int = 2000) -> str:
     if not query or not query.strip():
         raise ValidationError("Query cannot be empty")
