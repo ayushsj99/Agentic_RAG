@@ -20,7 +20,7 @@ if "services_checked" not in st.session_state:
 
 st.set_page_config(page_title="Agentic RAG", page_icon="🤖", layout="centered")
 
-# ── Sidebar: Document Upload ────────────────────────────────────────
+
 with st.sidebar:
     st.header("📄 Documents")
     
@@ -82,7 +82,7 @@ with st.sidebar:
         st.caption("No documents yet.")
 
 
-# ── Main Area: Chat ─────────────────────────────────────────────────
+
 st.title("🤖 Agentic RAG Chat")
 
 for msg in st.session_state.messages:

@@ -1,4 +1,5 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain.tools import tool
 from database.chroma_db_setup import vector_store_chroma
 from models.ollama_emb import ollama_embeddings
@@ -9,6 +10,10 @@ from backend.exceptions import RetrieverError, retry
 FETCH_K = 20
 FINAL_K = 5
 LAMBDA_MULT = 0.5
+RRF_K = 60
+MIN_RERANK_SCORE = 0.1
+MAX_WORKERS = 3
+
 USE_MMR = True
 USE_MULTI_QUERY = True
 USE_HYDE = True
@@ -38,32 +43,45 @@ def _mmr_search(query: str, k: int = FINAL_K, fetch_k: int = FETCH_K):
 
 
 @retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
+def _similarity_search_with_scores(query: str, k: int = 10):
+    return vector_store_chroma.similarity_search_with_relevance_scores(query, k=k)
+
+
+@retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
 def _similarity_search(query: str, k: int = 10):
     return vector_store_chroma.similarity_search(query, k=k)
 
 
 def _generate_query_variants(query: str, n: int = 3) -> list[str]:
     prompt = (
-        f"Generate {n} different search queries to find information about:\n"
-        f"Original: {query}\n\n"
-        f"Write {n} alternative queries, one per line. No numbering."
+        f"You are an expert at reformulating search queries to find relevant documents.\n"
+        f"Given the original query, generate {n} DIFFERENT search queries that:\n"
+        f"1. Use synonyms and alternative phrasings\n"
+        f"2. Focus on different aspects of the question\n"
+        f"3. Vary between specific and general formulations\n\n"
+        f"Original query: {query}\n\n"
+        f"Write exactly {n} alternative queries, one per line. No numbering or explanations."
     )
     try:
         response = ollama_model.invoke([{"role": "user", "content": prompt}])
-        variants = [q.strip() for q in response.content.strip().split('\n') if q.strip()]
-        variants = [query] + variants[:n]
+        lines = response.content.strip().split('\n')
+        variants = [q.strip() for q in lines if q.strip() and len(q.strip()) > 5]
+        variants = variants[:n]  # Don't include original - it's searched separately
         log("retriever", f"Generated {len(variants)} query variants")
         return variants
     except Exception as e:
         log("retriever", f"Multi-query generation failed: {e}")
-        return [query]
+        return []
 
 
 def _generate_hypothetical_doc(query: str) -> str:
     prompt = (
-        f"Write a short paragraph (2-3 sentences) that directly answers this question:\n"
-        f"{query}\n\n"
-        f"Write as if you are quoting from a document that contains the answer."
+        f"You are a knowledgeable assistant. Write a short, factual paragraph (2-3 sentences) "
+        f"that directly and specifically answers this question:\n\n"
+        f"Question: {query}\n\n"
+        f"Write as if you are quoting from an authoritative document. "
+        f"Include specific details, names, numbers, or facts that would appear in such a document. "
+        f"Do not say 'I don't know' - make a reasonable educated guess."
     )
     try:
         response = ollama_model.invoke([{"role": "user", "content": prompt}])
@@ -72,7 +90,29 @@ def _generate_hypothetical_doc(query: str) -> str:
         return hypothetical
     except Exception as e:
         log("retriever", f"HyDE generation failed: {e}")
-        return query
+        return ""
+
+
+def _reciprocal_rank_fusion(ranked_lists: list[list], k: int = RRF_K) -> list:
+    doc_scores = {}
+    doc_objects = {}
+    
+    for ranked_docs in ranked_lists:
+        for rank, doc in enumerate(ranked_docs):
+            doc_hash = hashlib.md5(doc.page_content.encode()).hexdigest()
+            rrf_score = 1.0 / (k + rank + 1)
+            
+            if doc_hash in doc_scores:
+                doc_scores[doc_hash] += rrf_score
+            else:
+                doc_scores[doc_hash] = rrf_score
+                doc_objects[doc_hash] = doc
+    
+    sorted_hashes = sorted(doc_scores.keys(), key=lambda h: doc_scores[h], reverse=True)
+    fused_docs = [doc_objects[h] for h in sorted_hashes]
+    
+    log("retriever", f"RRF fused {sum(len(rl) for rl in ranked_lists)} docs -> {len(fused_docs)} unique")
+    return fused_docs
 
 
 def _rerank_docs(query: str, docs: list, top_k: int = FINAL_K) -> list:
@@ -85,49 +125,63 @@ def _rerank_docs(query: str, docs: list, top_k: int = FINAL_K) -> list:
     
     scored_docs = list(zip(docs, scores))
     scored_docs.sort(key=lambda x: x[1], reverse=True)
+    filtered = [(doc, score) for doc, score in scored_docs if score >= MIN_RERANK_SCORE]
     
-    reranked = [doc for doc, score in scored_docs[:top_k]]
-    log("retriever", f"Reranked {len(docs)} docs -> top {len(reranked)}")
+    if not filtered:
+        log("retriever", f"All docs below threshold {MIN_RERANK_SCORE}, taking top {top_k}")
+        filtered = scored_docs[:top_k]
+    
+    reranked = [doc for doc, score in filtered[:top_k]]
+    top_scores = [f"{score:.3f}" for _, score in filtered[:top_k]]
+    log("retriever", f"Reranked: {len(docs)} -> {len(reranked)} (scores: {', '.join(top_scores)})")
     return reranked
 
 
-def _deduplicate(docs: list) -> list:
-    seen = set()
-    unique = []
-    for doc in docs:
-        h = hashlib.md5(doc.page_content.encode()).hexdigest()
-        if h not in seen:
-            seen.add(h)
-            unique.append(doc)
-    return unique
+def _parallel_search(queries: list[str], search_fn, k: int = 5) -> list[list]:
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_query = {executor.submit(search_fn, q, k): q for q in queries}
+        for future in as_completed(future_to_query):
+            try:
+                docs = future.result()
+                results.append(docs)
+            except Exception as e:
+                log("retriever", f"Parallel search failed for one query: {e}")
+                results.append([])
+    return results
 
 
 def _advanced_retrieve(query: str) -> list:
-    all_docs = []
+    ranked_lists = []
+    search_fn = _mmr_search if USE_MMR else _similarity_search
+    original_docs = search_fn(query, k=FETCH_K if not USE_MMR else FINAL_K * 2)
+    ranked_lists.append(original_docs)
+    log("retriever", f"Original query retrieved {len(original_docs)} docs")
     
     if USE_HYDE:
         hypothetical = _generate_hypothetical_doc(query)
-        hyde_docs = _mmr_search(hypothetical, k=FINAL_K) if USE_MMR else _similarity_search(hypothetical, k=FINAL_K)
-        all_docs.extend(hyde_docs)
-        log("retriever", f"HyDE retrieved {len(hyde_docs)} docs")
+        if hypothetical and hypothetical != query:
+            hyde_docs = search_fn(hypothetical, k=FINAL_K * 2)
+            ranked_lists.append(hyde_docs)
+            log("retriever", f"HyDE retrieved {len(hyde_docs)} docs")
     
     if USE_MULTI_QUERY:
         variants = _generate_query_variants(query, n=3)
-        for v in variants:
-            v_docs = _mmr_search(v, k=3) if USE_MMR else _similarity_search(v, k=3)
-            all_docs.extend(v_docs)
-        log("retriever", f"Multi-query retrieved {len(all_docs)} total docs")
-    else:
-        direct_docs = _mmr_search(query, k=FETCH_K) if USE_MMR else _similarity_search(query, k=FETCH_K)
-        all_docs.extend(direct_docs)
+        if variants:
+            variant_results = _parallel_search(variants, search_fn, k=FINAL_K)
+            ranked_lists.extend(variant_results)
+            total_variant_docs = sum(len(r) for r in variant_results)
+            log("retriever", f"Multi-query ({len(variants)} variants) retrieved {total_variant_docs} docs")
     
-    unique_docs = _deduplicate(all_docs)
-    log("retriever", f"After dedup: {len(unique_docs)} unique docs")
-    
-    if USE_RERANK and len(unique_docs) > FINAL_K:
-        final_docs = _rerank_docs(query, unique_docs, top_k=FINAL_K)
+    if len(ranked_lists) > 1:
+        fused_docs = _reciprocal_rank_fusion(ranked_lists)
     else:
-        final_docs = unique_docs[:FINAL_K]
+        fused_docs = ranked_lists[0] if ranked_lists else []
+    
+    if USE_RERANK and len(fused_docs) > FINAL_K:
+        final_docs = _rerank_docs(query, fused_docs, top_k=FINAL_K)
+    else:
+        final_docs = fused_docs[:FINAL_K]
     
     return final_docs
 

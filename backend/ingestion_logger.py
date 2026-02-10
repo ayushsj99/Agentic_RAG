@@ -10,7 +10,7 @@ import logging
 import time
 from contextlib import contextmanager
 
-# ── Console-only logger ─────────────────────────────────────────────
+
 _logger = logging.getLogger("ingestion_pipeline")
 _logger.setLevel(logging.INFO)
 _logger.propagate = False          # don't bubble up to root / agent logger
@@ -27,7 +27,6 @@ _console.setFormatter(
 _logger.addHandler(_console)
 
 
-# ── Public helpers ───────────────────────────────────────────────────
 
 def log(step: str, message: str) -> None:
     """Log an ingestion step to console only."""

@@ -17,7 +17,6 @@ from threading import Lock
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ── File logger (persistent) ────────────────────────────────────────
 _file_logger = logging.getLogger("agentic_rag")
 _file_logger.setLevel(logging.INFO)
 
@@ -31,14 +30,12 @@ _file_handler = RotatingFileHandler(
 _file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 _file_logger.addHandler(_file_handler)
 
-# ── Console logger (visible in terminal) ───────────────────────────
 _console_handler = logging.StreamHandler(
     stream=open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
 )
 _console_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
 _file_logger.addHandler(_console_handler)
 
-# ── In-memory log buffer (per-query, shown in the UI) ───────────────
 _buffer: list[dict] = []
 _lock = Lock()
 MAX_BUFFER_SIZE = 1000
