@@ -41,6 +41,7 @@ _file_logger.addHandler(_console_handler)
 # ── In-memory log buffer (per-query, shown in the UI) ───────────────
 _buffer: list[dict] = []
 _lock = Lock()
+MAX_BUFFER_SIZE = 1000
 
 
 def log(step: str, message: str) -> None:
@@ -52,6 +53,8 @@ def log(step: str, message: str) -> None:
     }
     with _lock:
         _buffer.append(entry)
+        if len(_buffer) > MAX_BUFFER_SIZE:
+            _buffer[:] = _buffer[-MAX_BUFFER_SIZE:]
     _file_logger.info(f"[{step}] {message}")
 
 

@@ -17,3 +17,4 @@ python-multipart
 requests
 docx2txt
 pypdf
+sentence-transformers

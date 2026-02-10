@@ -1,9 +1,19 @@
 from langgraph.graph import MessagesState
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from models.gemini_LLM import gemini_model
 from models.ollama_LLM import ollama_model
 from backend.agent_logger import log
 from backend.exceptions import LLMError, retry
+
+
+def _get_last_user_question(messages) -> str:
+    """Extract the last user question from messages."""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return msg.content
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return msg.get("content", "")
+    return messages[0].content if messages else ""
 
 
 GENERATE_PROMPT = (
@@ -28,7 +38,7 @@ def _invoke_llm(prompt: str):
 
 def generate_answer(state: MessagesState):
     """Generate an answer."""
-    question = state["messages"][0].content
+    question = _get_last_user_question(state["messages"])
     context = state["messages"][-1].content
     log("answer_generator", "Generating final answer from retrieved context...")
     log("answer_generator", f"  Question: {question[:150]}")

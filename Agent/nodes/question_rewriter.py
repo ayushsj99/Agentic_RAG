@@ -5,6 +5,17 @@ from langgraph.graph import MessagesState
 from backend.agent_logger import log
 from backend.exceptions import LLMError, retry
 
+
+def _get_last_user_question(messages) -> str:
+    """Extract the last user question from messages."""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return msg.content
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return msg.get("content", "")
+    return messages[0].content if messages else ""
+
+
 REWRITE_PROMPT = (
     "The previous document search for the question below did not return "
     "good results. Rewrite it as a better search query using different "
@@ -31,7 +42,7 @@ def _invoke_rewrite(prompt: str):
 
 def rewrite_question(state: MessagesState):
     messages = state["messages"]
-    question = messages[0].content
+    question = _get_last_user_question(messages)
     log("rewriter", f"Rewriting question: {question[:120]}")
     prompt = REWRITE_PROMPT.format(question=question)
     

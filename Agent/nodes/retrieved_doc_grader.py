@@ -1,10 +1,20 @@
 from pydantic import BaseModel, Field
 from typing import Literal
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import ToolMessage, HumanMessage
 from models.gemini_LLM import gemini_model
 from models.ollama_LLM import ollama_model
 from langgraph.graph import MessagesState
 from backend.agent_logger import log
+
+
+def _get_last_user_question(messages) -> str:
+    """Extract the last user question from messages."""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return msg.content
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return msg.get("content", "")
+    return messages[0].content if messages else ""
 
 # Maximum number of retrieve -> rewrite loops before forcing an answer
 MAX_REWRITE_LOOPS = 5
@@ -30,7 +40,7 @@ grader_model = ollama_model
 def grade_documents(
     state: MessagesState,
 ) -> Literal["generate_answer", "rewrite_question", "cannot_answer"]:
-    question = state["messages"][0].content
+    question = _get_last_user_question(state["messages"])
     context = state["messages"][-1].content
 
     retrieval_count = sum(
