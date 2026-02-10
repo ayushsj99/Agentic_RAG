@@ -8,5 +8,4 @@ ollama_model = ChatOllama(
     model="llama3.1:8b",  
     temperature=0.0,
     base_url="http://localhost:11434",
-    format="json" 
 )

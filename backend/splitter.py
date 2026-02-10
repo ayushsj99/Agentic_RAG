@@ -32,7 +32,7 @@ def split_docs(documents: list[Document]) -> list[Document]:
             if content_type == "table":
                 splits = table_splitter.split_text(doc.page_content)
                 splitter_type = "table"
-            elif file_type == '.pptx':
+            elif content_type == "slide" or file_type == ".pptx":
                 splits = [doc.page_content]
                 splitter_type = "slide"
             else:

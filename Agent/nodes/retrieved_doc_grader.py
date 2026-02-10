@@ -10,23 +10,17 @@ from backend.agent_logger import log
 MAX_REWRITE_LOOPS = 5
 
 GRADE_PROMPT = (
-    "You are a strict relevance grader for a document retrieval system.\n\n"
-    "User question: {question}\n\n"
-    "Retrieved document:\n{context}\n\n"
-    "Determine if the document contains information that can help answer "
-    "the user's question. Consider:\n"
-    "- Does it mention the same topic, entities, or concepts?\n"
-    "- Does it provide facts, data, or context useful for answering?\n"
-    "- Partial relevance still counts as 'yes'.\n\n"
-    "Respond with 'yes' if the document is relevant, 'no' if it is completely unrelated."
+    "A user asked: {question}\n\n"
+    "Below are excerpts retrieved from their documents:\n{context}\n\n"
+    "Do ANY of these excerpts contain information related to the question? "
+    "Even a single relevant sentence counts as 'yes'. "
+    "Answer 'no' ONLY if every single excerpt is about a completely unrelated topic."
 )
 
 
-class GradeDocuments(BaseModel):  
-    """Grade documents using a binary score for relevance check."""
-
+class GradeDocuments(BaseModel):
     binary_score: str = Field(
-        description="Relevance score: 'yes' if relevant, or 'no' if not relevant"
+        description="'yes' if any excerpt is relevant, 'no' only if all are unrelated"
     )
 
 
@@ -36,11 +30,9 @@ grader_model = ollama_model
 def grade_documents(
     state: MessagesState,
 ) -> Literal["generate_answer", "rewrite_question", "cannot_answer"]:
-    """Determine whether the retrieved documents are relevant to the question."""
     question = state["messages"][0].content
     context = state["messages"][-1].content
 
-    # ── Loop-limit check ────────────────────────────────────────────
     retrieval_count = sum(
         1 for m in state["messages"] if isinstance(m, ToolMessage)
     )
@@ -52,19 +44,22 @@ def grade_documents(
             "Could not find relevant documents -> cannot answer.")
         return "cannot_answer"
 
-    # ── Normal grading ──────────────────────────────────────────────
+    # Take a sample of the context (first 1500 chars) so the LLM
+    # doesn't get overwhelmed and actually reads the content
+    context_sample = context[:1500]
     log("doc_grader", "Grading retrieved documents for relevance...")
     log("doc_grader", f"  Question: {question[:150]}")
-    log("doc_grader", f"  Context preview: {context[:200]}...")
-    prompt = GRADE_PROMPT.format(question=question, context=context)
+    log("doc_grader", f"  Context sample: {context_sample[:300]}...")
+
+    prompt = GRADE_PROMPT.format(question=question, context=context_sample)
     try:
         response = (
             grader_model
-            .with_structured_output(GradeDocuments).invoke(  
+            .with_structured_output(GradeDocuments).invoke(
                 [{"role": "user", "content": prompt}]
             )
         )
-        score = response.binary_score
+        score = response.binary_score.lower().strip()
     except Exception as e:
         log("doc_grader", f"Grading failed ({e}), defaulting to RELEVANT.")
         score = "yes"

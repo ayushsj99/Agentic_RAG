@@ -14,3 +14,5 @@ fastapi
 uvicorn[standard]
 python-multipart
 requests
+docx2txt
+pypdf
