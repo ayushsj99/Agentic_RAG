@@ -18,12 +18,22 @@ def _get_last_user_question(messages) -> str:
 # Maximum number of retrieve -> rewrite loops before forcing an answer
 MAX_REWRITE_LOOPS = 5
 
+
 GRADE_PROMPT = (
-    "A user asked: {question}\n\n"
-    "Below are excerpts retrieved from their documents:\n{context}\n\n"
-    "Do ANY of these excerpts contain information related to the question? "
-    "Even a single relevant sentence counts as 'yes'. "
-    "Answer 'no' ONLY if every single excerpt is about a completely unrelated topic."
+    "You are a helpful document relevance grader.\n\n"
+    "User Question: {question}\n\n"
+    "Retrieved Context:\n{context}\n\n"
+    "TASK: Decide whether the retrieved context is useful for answering the user's question.\n\n"
+    "Grade as 'yes' if ANY of the following are true:\n"
+    "- The context directly answers the question\n"
+    "- The context contains partial information, keywords, names, numbers, or identifiers related to the question\n"
+    "- The context is from the same document and could reasonably help infer or locate the answer\n"
+    "- The context includes a sentence or phrase that appears relevant, even if the answer is not complete\n\n"
+    "Grade as 'no' ONLY if:\n"
+    "- The context is completely unrelated to the question\n"
+    "- The context discusses an entirely different topic with no overlap in meaning or intent\n\n"
+    "Be inclusive rather than strict. If unsure, lean toward 'yes'.\n\n"
+    "Binary score: 'yes' or 'no'"
 )
 
 
@@ -36,24 +46,33 @@ class GradeDocuments(BaseModel):
 grader_model = ollama_model
 
 
-def grade_documents(
-    state: MessagesState,
-) -> Literal["generate_answer", "rewrite_question", "cannot_answer"]:
+def grade_documents(state: MessagesState) -> Literal["generate_answer", "rewrite_question", "cannot_answer"]:
     question = _get_last_user_question(state["messages"])
     context = state["messages"][-1].content
 
-    retrieval_count = sum(
-        1 for m in state["messages"] if isinstance(m, ToolMessage)
-    )
+    retrieval_count = sum(1 for m in state["messages"] if isinstance(m, ToolMessage))
     log("doc_grader", f"Retrieval loop {retrieval_count}/{MAX_REWRITE_LOOPS}")
 
+    # ALWAYS CHECK LOOP LIMIT FIRST
     if retrieval_count >= MAX_REWRITE_LOOPS:
-        log("doc_grader",
-            f"Hit max rewrite loops ({MAX_REWRITE_LOOPS}). "
-            "Could not find relevant documents -> cannot answer.")
-        return "cannot_answer"
+        log("doc_grader", f"Max loops reached. Generating answer with available context or failing gracefully.")
+        
+        # Clean the low confidence flag if present
+        clean_context = context.replace("[LOW_CONFIDENCE_RETRIEVAL]\n\n", "")
+        
+        if clean_context and clean_context.strip() and clean_context != "No relevant documents found.":
+            log("doc_grader", "Forcing answer generation with best available context")
+            return "generate_answer"
+        else:
+            log("doc_grader", "No usable context found")
+            return "cannot_answer"
 
+    # Check low confidence
+    if context.startswith("[LOW_CONFIDENCE_RETRIEVAL]"):
+        log("doc_grader", "Low confidence -> rewriting question")
+        return "rewrite_question"
 
+    # Normal grading
     context_sample = context[:1500]
     log("doc_grader", "Grading retrieved documents for relevance...")
     log("doc_grader", f"  Question: {question[:150]}")
@@ -61,11 +80,8 @@ def grade_documents(
 
     prompt = GRADE_PROMPT.format(question=question, context=context_sample)
     try:
-        response = (
-            grader_model
-            .with_structured_output(GradeDocuments).invoke(
-                [{"role": "user", "content": prompt}]
-            )
+        response = grader_model.with_structured_output(GradeDocuments).invoke(
+            [{"role": "user", "content": prompt}]
         )
         score = response.binary_score.lower().strip()
     except Exception as e:
@@ -76,7 +92,5 @@ def grade_documents(
         log("doc_grader", "Documents are RELEVANT -> generating answer.")
         return "generate_answer"
     else:
-        log("doc_grader",
-            f"Documents NOT relevant -> rewriting question "
-            f"(attempt {retrieval_count}/{MAX_REWRITE_LOOPS}).")
+        log("doc_grader", f"Documents NOT relevant -> rewriting (attempt {retrieval_count}/{MAX_REWRITE_LOOPS}).")
         return "rewrite_question"

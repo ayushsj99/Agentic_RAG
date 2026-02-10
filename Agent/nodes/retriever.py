@@ -1,5 +1,6 @@
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from langchain.tools import tool
 from database.database_config import vector_store, DATABASE_BACKEND
 from models.ollama_emb import ollama_embeddings
@@ -7,18 +8,19 @@ from models.ollama_LLM import ollama_model
 from backend.agent_logger import log
 from backend.exceptions import RetrieverError, retry
 
+# Configuration
 FETCH_K = 20
 FINAL_K = 5
 LAMBDA_MULT = 0.5
 RRF_K = 60
-MIN_RERANK_SCORE = 0.1
+MIN_RERANK_SCORE = -3.0
 MAX_WORKERS = 3
 
 USE_MMR = True
 USE_MULTI_QUERY = True
-USE_HYDE = True
+USE_HYDE = False
 USE_RERANK = True
-USE_HYBRID = True  # Use Milvus native hybrid search (dense + BM25)
+USE_HYBRID = True
 
 _reranker = None
 _milvus_ranker = None
@@ -42,7 +44,7 @@ def _get_milvus_ranker():
     if _milvus_ranker is None:
         try:
             from langchain_milvus import WeightedRanker
-            _milvus_ranker = WeightedRanker(0.6, 0.4)  # 60% dense, 40% sparse (BM25)
+            _milvus_ranker = WeightedRanker(0.6, 0.4)
             log("retriever", "Loaded Milvus WeightedRanker for hybrid search")
         except ImportError:
             log("retriever", "WeightedRanker not available, using default")
@@ -66,30 +68,67 @@ def _mmr_search(query: str, k: int = FINAL_K, fetch_k: int = FETCH_K):
 
 
 @retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
-def _similarity_search_with_scores(query: str, k: int = 10):
-    return vector_store.similarity_search_with_relevance_scores(query, k=k)
-
-
-@retry(max_attempts=2, delay=0.5, exceptions=(Exception,))
 def _similarity_search(query: str, k: int = 10):
     return vector_store.similarity_search(query, k=k)
 
 
-def _generate_query_variants(query: str, n: int = 3) -> list[str]:
+@lru_cache(maxsize=100)
+def _classify_query_complexity(query: str) -> str:
+    """Classify query as simple, medium, or complex."""
     prompt = (
-        f"You are an expert at reformulating search queries to find relevant documents.\n"
-        f"Given the original query, generate {n} DIFFERENT search queries that:\n"
-        f"1. Use synonyms and alternative phrasings\n"
-        f"2. Focus on different aspects of the question\n"
-        f"3. Vary between specific and general formulations\n\n"
-        f"Original query: {query}\n\n"
-        f"Write exactly {n} alternative queries, one per line. No numbering or explanations."
+        "Classify this search query as 'simple', 'medium', or 'complex':\n\n"
+        "- simple: Single factual lookup (one specific fact, name, number, date)\n"
+        "  Examples: 'what is the roll number', 'who is the author', 'what is the price'\n\n"
+        "- medium: Concept explanation, process description, single cohesive answer\n"
+        "  Examples: 'how does the system work', 'explain the workflow', 'what are the benefits'\n\n"
+        "- complex: List/comparison/synthesis questions needing multiple chunks\n"
+        "  Examples: 'what all X are covered', 'list requirements', 'compare X and Y',\n"
+        "           'what is covered and not covered', 'analyze', 'summarize all'\n\n"
+        f"Query: {query}\n\n"
+        "Respond with ONLY one word: simple, medium, or complex"
+    )
+    
+    try:
+        response = ollama_model.invoke([{"role": "user", "content": prompt}])
+        complexity = response.content.strip().lower()
+        if complexity in ['simple', 'medium', 'complex']:
+            log("retriever", f"Query classified as: {complexity.upper()}")
+            return complexity
+        else:
+            log("retriever", f"Invalid classification, defaulting to medium")
+            return "medium"
+    except Exception as e:
+        log("retriever", f"Classification failed: {e}, defaulting to medium")
+        return "medium"
+
+
+def _get_optimal_k(complexity: str) -> tuple[int, int]:
+    """Return (fetch_k, final_k) based on query complexity."""
+    if complexity == "simple":
+        return 10, 8
+    elif complexity == "medium":
+        return 20, 15
+    else:
+        return 30, 15  # Increased for complex queries
+
+
+def _is_list_query(query: str) -> bool:
+    """Detect if query asks for multiple items/list."""
+    list_keywords = ['all', 'list', 'covered', 'not covered', 'which', 'requirements', 
+                     'objectives', 'what are', 'enumerate', 'every']
+    return any(keyword in query.lower() for keyword in list_keywords)
+
+
+def _generate_query_variants(query: str, n: int = 3) -> list[str]:
+    """Generate alternative query formulations."""
+    prompt = (
+        f"Generate {n} alternative search queries for:\n{query}\n\n"
+        f"Use synonyms and different phrasings. One per line, no numbering."
     )
     try:
         response = ollama_model.invoke([{"role": "user", "content": prompt}])
         lines = response.content.strip().split('\n')
-        variants = [q.strip() for q in lines if q.strip() and len(q.strip()) > 5]
-        variants = variants[:n]  # Don't include original - it's searched separately
+        variants = [q.strip() for q in lines if q.strip() and len(q.strip()) > 5][:n]
         log("retriever", f"Generated {len(variants)} query variants")
         return variants
     except Exception as e:
@@ -97,26 +136,8 @@ def _generate_query_variants(query: str, n: int = 3) -> list[str]:
         return []
 
 
-def _generate_hypothetical_doc(query: str) -> str:
-    prompt = (
-        f"You are a knowledgeable assistant. Write a short, factual paragraph (2-3 sentences) "
-        f"that directly and specifically answers this question:\n\n"
-        f"Question: {query}\n\n"
-        f"Write as if you are quoting from an authoritative document. "
-        f"Include specific details, names, numbers, or facts that would appear in such a document. "
-        f"Do not say 'I don't know' - make a reasonable educated guess."
-    )
-    try:
-        response = ollama_model.invoke([{"role": "user", "content": prompt}])
-        hypothetical = response.content.strip()
-        log("retriever", f"Generated HyDE doc: {hypothetical[:100]}...")
-        return hypothetical
-    except Exception as e:
-        log("retriever", f"HyDE generation failed: {e}")
-        return ""
-
-
 def _reciprocal_rank_fusion(ranked_lists: list[list], k: int = RRF_K) -> list:
+    """Fuse multiple ranked lists using RRF."""
     doc_scores = {}
     doc_objects = {}
     
@@ -138,29 +159,42 @@ def _reciprocal_rank_fusion(ranked_lists: list[list], k: int = RRF_K) -> list:
     return fused_docs
 
 
-def _rerank_docs(query: str, docs: list, top_k: int = FINAL_K) -> list:
+def _rerank_docs(query: str, docs: list, top_k: int = FINAL_K, force_diversity: bool = False) -> tuple[list, bool]:
+    """Rerank documents using cross-encoder. Returns (docs, is_confident)."""
     reranker = _get_reranker()
     if not reranker or not docs:
-        return docs[:top_k]
+        return docs[:top_k], True
     
     pairs = [(query, doc.page_content) for doc in docs]
     scores = reranker.predict(pairs)
     
     scored_docs = list(zip(docs, scores))
     scored_docs.sort(key=lambda x: x[1], reverse=True)
-    filtered = [(doc, score) for doc, score in scored_docs if score >= MIN_RERANK_SCORE]
     
-    if not filtered:
-        log("retriever", f"All docs below threshold {MIN_RERANK_SCORE}, taking top {top_k}")
-        filtered = scored_docs[:top_k]
+    best_score = scored_docs[0][1] if scored_docs else -100
+    is_confident = best_score >= MIN_RERANK_SCORE
     
-    reranked = [doc for doc, score in filtered[:top_k]]
-    top_scores = [f"{score:.3f}" for _, score in filtered[:top_k]]
+    # For list/multi-part queries, return top_k regardless of threshold
+    if force_diversity:
+        reranked = [doc for doc, score in scored_docs[:top_k]]
+        log("retriever", f"Diversity mode: returning top {len(reranked)} docs")
+    else:
+        filtered = [(doc, score) for doc, score in scored_docs if score >= MIN_RERANK_SCORE]
+        
+        if not filtered:
+            log("retriever", f"All docs below threshold {MIN_RERANK_SCORE}, best={best_score:.3f}")
+            filtered = scored_docs[:top_k]
+        
+        reranked = [doc for doc, score in filtered[:top_k]]
+    
+    top_scores = [f"{score:.3f}" for doc, score in scored_docs[:len(reranked)]]
     log("retriever", f"Reranked: {len(docs)} -> {len(reranked)} (scores: {', '.join(top_scores)})")
-    return reranked
+    
+    return reranked, is_confident
 
 
 def _parallel_search(queries: list[str], search_fn, k: int = 5) -> list[list]:
+    """Execute multiple searches in parallel."""
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_query = {executor.submit(search_fn, q, k): q for q in queries}
@@ -169,76 +203,147 @@ def _parallel_search(queries: list[str], search_fn, k: int = 5) -> list[list]:
                 docs = future.result()
                 results.append(docs)
             except Exception as e:
-                log("retriever", f"Parallel search failed for one query: {e}")
+                log("retriever", f"Parallel search failed: {e}")
                 results.append([])
     return results
 
 
-def _advanced_retrieve(query: str) -> list:
+def _simple_retrieve(query: str, fetch_k: int, final_k: int) -> tuple[list, bool]:
+    """Simple retrieval - basic search only, no reranking."""
+    log("retriever", "Using SIMPLE retrieval (basic search, no reranking)")
+    
+    if DATABASE_BACKEND == "milvus" and USE_HYBRID:
+        docs = _hybrid_search(query, k=final_k)
+        log("retriever", f"Hybrid search returned {len(docs)} docs")
+    else:
+        docs = _similarity_search(query, k=final_k)
+        log("retriever", f"Similarity search returned {len(docs)} docs")
+    
+    return docs, True
+
+
+def _medium_retrieve(query: str, fetch_k: int, final_k: int) -> tuple[list, bool]:
+    """Medium retrieval - hybrid/MMR + light reranking."""
+    log("retriever", "Using MEDIUM retrieval (hybrid + reranking)")
+    
+    if DATABASE_BACKEND == "milvus" and USE_HYBRID:
+        docs = _hybrid_search(query, k=fetch_k)
+    else:
+        docs = _mmr_search(query, k=final_k, fetch_k=fetch_k)
+    
+    # Detect list queries
+    is_list = _is_list_query(query)
+    if is_list:
+        final_k = min(final_k + 2, 10)
+        log("retriever", f"List query detected, increasing final_k to {final_k}")
+    
+    if USE_RERANK and len(docs) > final_k:
+        docs, is_confident = _rerank_docs(query, docs, top_k=final_k, force_diversity=is_list)
+    else:
+        docs = docs[:final_k]
+        is_confident = True
+    
+    return docs, is_confident
+
+
+def _complex_retrieve(query: str, fetch_k: int, final_k: int) -> tuple[list, bool]:
+    """Complex retrieval - multi-query + fusion + reranking."""
+    log("retriever", "Using COMPLEX retrieval (multi-query + fusion + reranking)")
+    
     ranked_lists = []
     
-    # Select search function based on backend and settings
     if DATABASE_BACKEND == "milvus" and USE_HYBRID:
         search_fn = _hybrid_search
-        log("retriever", "Using Milvus hybrid search (dense + BM25)")
     elif USE_MMR:
         search_fn = _mmr_search
     else:
         search_fn = _similarity_search
     
-    original_docs = search_fn(query, k=FETCH_K if not USE_MMR else FINAL_K * 2)
+    # Original query
+    original_docs = search_fn(query, k=fetch_k)
     ranked_lists.append(original_docs)
-    log("retriever", f"Original query retrieved {len(original_docs)} docs")
+    log("retriever", f"Original query: {len(original_docs)} docs")
     
-    if USE_HYDE:
-        hypothetical = _generate_hypothetical_doc(query)
-        if hypothetical and hypothetical != query:
-            hyde_docs = search_fn(hypothetical, k=FINAL_K * 2)
-            ranked_lists.append(hyde_docs)
-            log("retriever", f"HyDE retrieved {len(hyde_docs)} docs")
-    
+    # Multi-query expansion
     if USE_MULTI_QUERY:
         variants = _generate_query_variants(query, n=3)
         if variants:
-            variant_results = _parallel_search(variants, search_fn, k=FINAL_K)
+            variant_results = _parallel_search(variants, search_fn, k=final_k)
             ranked_lists.extend(variant_results)
-            total_variant_docs = sum(len(r) for r in variant_results)
-            log("retriever", f"Multi-query ({len(variants)} variants) retrieved {total_variant_docs} docs")
+            log("retriever", f"Multi-query: {sum(len(r) for r in variant_results)} docs")
     
+    # Fusion
     if len(ranked_lists) > 1:
         fused_docs = _reciprocal_rank_fusion(ranked_lists)
     else:
         fused_docs = ranked_lists[0] if ranked_lists else []
     
-    if USE_RERANK and len(fused_docs) > FINAL_K:
-        final_docs = _rerank_docs(query, fused_docs, top_k=FINAL_K)
-    else:
-        final_docs = fused_docs[:FINAL_K]
+    # Detect list queries and increase final_k
+    is_list = _is_list_query(query)
+    if is_list:
+        final_k = min(final_k + 3, 12)
+        log("retriever", f"List query detected, increasing final_k to {final_k}")
     
-    return final_docs
+    # Reranking
+    if USE_RERANK and len(fused_docs) > final_k:
+        final_docs, is_confident = _rerank_docs(query, fused_docs, top_k=final_k, force_diversity=is_list)
+    else:
+        final_docs = fused_docs[:final_k]
+        is_confident = True
+    
+    return final_docs, is_confident
+
+
+def _adaptive_retrieve(query: str) -> tuple[list, bool]:
+    """Route to appropriate retrieval strategy based on query complexity."""
+    
+    complexity = _classify_query_complexity(query)
+    fetch_k, final_k = _get_optimal_k(complexity)
+    log("retriever", f"Optimal K values: fetch={fetch_k}, final={final_k}")
+    
+    try:
+        if complexity == "simple":
+            docs, is_confident = _simple_retrieve(query, fetch_k, final_k)
+        elif complexity == "medium":
+            docs, is_confident = _medium_retrieve(query, fetch_k, final_k)
+        else:
+            docs, is_confident = _complex_retrieve(query, fetch_k, final_k)
+        
+        return docs, is_confident
+        
+    except Exception as e:
+        log("retriever", f"{complexity.title()} retrieval failed, falling back: {e}")
+        try:
+            docs = _similarity_search(query, k=final_k)
+            return docs, False
+        except Exception as e2:
+            log("retriever", f"Fallback failed: {e2}")
+            raise RetrieverError(f"All retrieval strategies failed: {e2}")
 
 
 @tool()
 def retrieve_context(query: str):
-    """Retrieve information to help answer a query."""
+    """Retrieve information to help answer a query using adaptive retrieval strategy."""
     log("retriever", f"Searching for: {query[:120]}")
     
     try:
-        retrieved_docs = _advanced_retrieve(query)
+        retrieved_docs, is_confident = _adaptive_retrieve(query)
     except Exception as e:
-        log("retriever", f"Advanced retrieval failed, falling back: {e}")
-        try:
-            retrieved_docs = _similarity_search(query, k=FINAL_K)
-        except Exception as e2:
-            log("retriever", f"Fallback also failed: {e2}")
-            raise RetrieverError(f"Document retrieval failed: {e2}")
+        log("retriever", f"Adaptive retrieval failed: {e}")
+        raise RetrieverError(f"Document retrieval failed: {e}")
     
-    log("retriever", f"Final result: {len(retrieved_docs)} documents")
+    log("retriever", f"Final result: {len(retrieved_docs)} documents (confident={is_confident})")
+    
     for i, doc in enumerate(retrieved_docs):
         source = doc.metadata.get("source", doc.metadata.get("file_name", "unknown"))
         log("retriever", f"  Doc {i+1} [{source}]: {doc.page_content[:100]}...")
     
     serialized = "\n\n---\n\n".join(doc.page_content for doc in retrieved_docs)
+    
+    if not is_confident:
+        log("retriever", "Low confidence retrieval - flagging for query rewrite")
+        serialized = "[LOW_CONFIDENCE_RETRIEVAL]\n\n" + serialized
+    
     return serialized if serialized else "No relevant documents found."
 
 
