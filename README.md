@@ -26,15 +26,15 @@ An Agentic RAG System that uses AI agents to intelligently retrieve and answer q
 
 You can choose between Milvus and ChromaDB as your vector database backend:
 
-- **Milvus** (default):
-  - In `database/database_config.py`, ensure:
-	 ```python
-	 DATABASE_BACKEND = "milvus"
-	 ```
-- **ChromaDB** (simpler, no Docker required):
+- **ChromaDB** (simpler, no Docker required) [default]:
   - In `database/database_config.py`, change:
 	 ```python
 	 DATABASE_BACKEND = "chroma"
+	 ```
+- **Milvus** :
+  - In `database/database_config.py`, ensure:
+	 ```python
+	 DATABASE_BACKEND = "milvus"
 	 ```
 
 ### Python Environment Setup
@@ -66,7 +66,7 @@ You can choose between Milvus and ChromaDB as your vector database backend:
 	```
 2. Start Milvus (if using Milvus backend):
 	```
-	docker start milvus or docker compose up (as per your OS)
+	docker start milvus | docker compose up (as per your OS)
 	```
 3. Run the application (example):
 	```

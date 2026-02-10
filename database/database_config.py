@@ -8,7 +8,7 @@ Set DATABASE_BACKEND below to switch between vector stores:
 The vector_store object exported here is used throughout the project.
 """
 
-DATABASE_BACKEND = "milvus"  # Options: "chroma" or "milvus"
+DATABASE_BACKEND = "chroma"  # Options: "chroma" or "milvus"
 
 VALID_BACKENDS = ("chroma", "milvus")
 if DATABASE_BACKEND not in VALID_BACKENDS:
