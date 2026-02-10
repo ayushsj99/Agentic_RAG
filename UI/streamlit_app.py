@@ -85,7 +85,14 @@ with st.sidebar:
 
 
 
+
 st.title("🤖 Agentic RAG Chat")
+
+st.markdown("""
+<div style='position: fixed; left: 0; bottom: 0; width: 100%; background: #fafafa; padding: 6px 0 4px 0; border-top: 1px solid #eee; text-align: center; font-size: 12px; color: #888;'>
+By - Ayush Shashikant Jadhav &nbsp;|&nbsp; Roll No: 23f1002471 &nbsp;|&nbsp; <a href='mailto:23f1002471@ds.study.iitm.ac.in' style='color: #888;'>23f1002471@ds.study.iitm.ac.in</a>
+</div>
+""", unsafe_allow_html=True)
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):

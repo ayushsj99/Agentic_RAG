@@ -1,7 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Literal
 from langchain_core.messages import ToolMessage, HumanMessage
-from models.gemini_LLM import gemini_model
 from models.ollama_LLM import ollama_model
 from langgraph.graph import MessagesState
 from backend.agent_logger import log

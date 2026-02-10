@@ -1,6 +1,5 @@
 from langgraph.graph import MessagesState
 from langchain_core.messages import AIMessage, HumanMessage
-from models.gemini_LLM import gemini_model
 from models.ollama_LLM import ollama_model
 from backend.agent_logger import log
 from backend.exceptions import LLMError, retry
