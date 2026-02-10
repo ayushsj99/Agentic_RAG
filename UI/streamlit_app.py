@@ -7,6 +7,7 @@ from langgraph.errors import GraphRecursionError
 from backend.ingestion_pipeline import ingest_document
 from backend.agent_logger import log, get_logs, clear as clear_logs
 from database.reset_chroma import reset_chroma_db
+from backend.exceptions import check_ollama_health, check_chroma_health
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "backend", "data")
 DATA_DIR = os.path.abspath(DATA_DIR)
@@ -14,12 +15,29 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "services_checked" not in st.session_state:
+    st.session_state.services_checked = False
 
 st.set_page_config(page_title="Agentic RAG", page_icon="🤖", layout="centered")
 
 # ── Sidebar: Document Upload ────────────────────────────────────────
 with st.sidebar:
     st.header("📄 Documents")
+    
+    with st.expander("🔧 Service Status", expanded=not st.session_state.services_checked):
+        ollama_ok = check_ollama_health()
+        chroma_ok = check_chroma_health()
+        st.session_state.services_checked = True
+        
+        if ollama_ok:
+            st.success("Ollama: Connected")
+        else:
+            st.error("Ollama: Not available")
+        
+        if chroma_ok:
+            st.success("ChromaDB: Connected")
+        else:
+            st.warning("ChromaDB: Not initialized")
 
     uploaded_file = st.file_uploader(
         "Upload a document",

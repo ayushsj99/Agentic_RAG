@@ -1,6 +1,7 @@
 langchain
 langchain-text-splitters
 langchain-community
+langchain-experimental
 bs4
 langchain[google-genai]
 langchain-google-genai

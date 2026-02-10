@@ -1,8 +1,9 @@
 from langgraph.graph import MessagesState
+from langchain_core.messages import AIMessage
 from models.gemini_LLM import gemini_model
 from models.ollama_LLM import ollama_model
 from backend.agent_logger import log
-
+from backend.exceptions import LLMError, retry
 
 
 GENERATE_PROMPT = (
@@ -19,6 +20,12 @@ GENERATE_PROMPT = (
 
 response_model = ollama_model
 
+
+@retry(max_attempts=3, delay=1.0, exceptions=(Exception,))
+def _invoke_llm(prompt: str):
+    return response_model.invoke([{"role": "user", "content": prompt}])
+
+
 def generate_answer(state: MessagesState):
     """Generate an answer."""
     question = state["messages"][0].content
@@ -27,6 +34,12 @@ def generate_answer(state: MessagesState):
     log("answer_generator", f"  Question: {question[:150]}")
     log("answer_generator", f"  Context preview: {context[:200]}...")
     prompt = GENERATE_PROMPT.format(question=question, context=context)
-    response = response_model.invoke([{"role": "user", "content": prompt}])
-    log("answer_generator", f"  Final answer: {response.content[:300]}")
-    return {"messages": [response]}
+    
+    try:
+        response = _invoke_llm(prompt)
+        log("answer_generator", f"  Final answer: {response.content[:300]}")
+        return {"messages": [response]}
+    except Exception as e:
+        log("answer_generator", f"LLM call failed: {e}")
+        fallback = AIMessage(content="I encountered an error generating the answer. Please try again.")
+        return {"messages": [fallback]}
