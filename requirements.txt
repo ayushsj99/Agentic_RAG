@@ -7,3 +7,10 @@ langchain-google-genai
 langchain-milvus
 langchain-docling
 unstructured[all-docs]
+langchain-ollama
+langchain-chroma
+streamlit
+fastapi
+uvicorn[standard]
+python-multipart
+requests

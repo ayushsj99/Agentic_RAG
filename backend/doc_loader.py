@@ -7,6 +7,7 @@ from langchain_community.document_loaders import (
     UnstructuredExcelLoader,
     TextLoader,
 )
+from backend.ingestion_logger import log, info, success, warn, error, timed_step
 loaders = {
     ".pdf": PyPDFLoader,
     ".docx": Docx2txtLoader,
@@ -45,51 +46,64 @@ def load_docs(PATH: str):
         raise FileNotFoundError(f"Path {PATH} does not exist.")
     suff = path.suffix.lower()
     if suff not in supported_formats:
+        error(f"Unsupported file format: {suff}. Supported: {supported_formats}")
         raise ValueError(f"Unsupported file format: {suff}. Supported formats are: {supported_formats}")
-    print(f"Loading document from {path.name}...")
-    
-    
-    try:
-        loader = DoclingLoader(file_path=str(path))
-        documents = loader.load()
-        loader_used = "docling"
-    except Exception as e:
-        print(f"Error loading document: {e}")
-        print("Falling back to standard loader...")
-        try:
-            if suff == ".txt":
-                loader = TextLoader(
-                    str(path),
-                    encoding="utf-8",
-                    autodetect_encoding=True
-                )
-            else:
-                loader = loaders[suff](str(path))
 
+    log("LOAD", f"File: {path.name}  |  Format: {suff}  |  Size: {path.stat().st_size / 1024:.1f} KB")
+
+    with timed_step("DOCLING_LOAD"):
+        try:
+            loader = DoclingLoader(file_path=str(path))
             documents = loader.load()
-            loader_used = "fallback"
+            loader_used = "docling"
+            info(f"Docling parsed {len(documents)} raw sections")
         except Exception as e:
-            print(f"Error loading document with standard loader: {e}")
-            print("No documents loaded. Try with standard formats or check the file.")
-            return []
-    
+            warn(f"Docling failed: {e}")
+            log("FALLBACK", "Trying standard loader...")
+            try:
+                if suff == ".txt":
+                    loader = TextLoader(
+                        str(path),
+                        encoding="utf-8",
+                        autodetect_encoding=True
+                    )
+                else:
+                    loader = loaders[suff](str(path))
+
+                documents = loader.load()
+                loader_used = "fallback"
+                info(f"Fallback loader parsed {len(documents)} raw sections")
+            except Exception as e:
+                error(f"Fallback loader also failed: {e}")
+                return []
+
+    skipped = 0
     for doc in documents:
         doc.page_content = normalize_text(doc.page_content)
-            
+
         if len(doc.page_content) < 30:
+            skipped += 1
             continue
-        
+
         enrich_docling_metadata(doc)
-        
+
         doc.metadata.update({
                 "file_name": path.name,
                 "file_type": path.suffix,
                 "file_path": str(path),
                 "loader": loader_used,
         })
-        
-    
-    print(f"✅ Loaded {len(documents)} sections from {path.name}")
+
+    if skipped:
+        warn(f"Skipped {skipped} sections (content < 30 chars)")
+
+    content_types = {}
+    for doc in documents:
+        ct = doc.metadata.get("content_type", "text")
+        content_types[ct] = content_types.get(ct, 0) + 1
+    info(f"Content breakdown: {content_types}")
+
+    success(f"Loaded {len(documents)} sections from {path.name} (loader={loader_used})")
     return documents
 
 
